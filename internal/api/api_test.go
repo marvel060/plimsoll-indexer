@@ -192,7 +192,9 @@ func TestBreakdownServedVerbatim(t *testing.T) {
 	get(t, srv, "/v1/breakdowns/zzz", 404)
 }
 
-func corsRequest(t *testing.T, srv *httptest.Server, method, path, origin string) *http.Response {
+// corsRequest performs a request and returns its status and headers. The body
+// is drained and closed here, so callers get no handle to leak.
+func corsRequest(t *testing.T, srv *httptest.Server, method, path, origin string) (int, http.Header) {
 	t.Helper()
 	req, err := http.NewRequest(method, srv.URL+path, nil)
 	if err != nil {
@@ -205,12 +207,13 @@ func corsRequest(t *testing.T, srv *httptest.Server, method, path, origin string
 	if err != nil {
 		t.Fatal(err)
 	}
+	_, _ = io.Copy(io.Discard, resp.Body)
 	resp.Body.Close()
-	return resp
+	return resp.StatusCode, resp.Header
 }
 
-func hasVaryOrigin(resp *http.Response) bool {
-	for _, v := range resp.Header.Values("Vary") {
+func hasVaryOrigin(header http.Header) bool {
+	for _, v := range header.Values("Vary") {
 		for _, part := range strings.Split(v, ",") {
 			if strings.TrimSpace(part) == "Origin" {
 				return true
@@ -224,33 +227,33 @@ func TestCORSWildcardOrigin(t *testing.T) {
 	srv := server()
 	defer srv.Close()
 	for _, method := range []string{http.MethodGet, http.MethodOptions} {
-		resp := corsRequest(t, srv, method, "/v1/assets", "https://plimsoll.example")
-		if got := resp.Header.Get("Access-Control-Allow-Origin"); got != "*" {
+		_, header := corsRequest(t, srv, method, "/v1/assets", "https://plimsoll.example")
+		if got := header.Get("Access-Control-Allow-Origin"); got != "*" {
 			t.Fatalf("%s: Access-Control-Allow-Origin = %q, want *", method, got)
 		}
 	}
-	resp := corsRequest(t, srv, http.MethodOptions, "/v1/assets", "https://plimsoll.example")
-	if resp.StatusCode != http.StatusNoContent {
-		t.Fatalf("preflight status %d", resp.StatusCode)
+	status, header := corsRequest(t, srv, http.MethodOptions, "/v1/assets", "https://plimsoll.example")
+	if status != http.StatusNoContent {
+		t.Fatalf("preflight status %d", status)
 	}
-	if resp.Header.Get("Access-Control-Allow-Headers") == "" || resp.Header.Get("Access-Control-Max-Age") == "" {
+	if header.Get("Access-Control-Allow-Headers") == "" || header.Get("Access-Control-Max-Age") == "" {
 		t.Fatalf("preflight missing allow-headers (%q) or max-age (%q)",
-			resp.Header.Get("Access-Control-Allow-Headers"), resp.Header.Get("Access-Control-Max-Age"))
+			header.Get("Access-Control-Allow-Headers"), header.Get("Access-Control-Max-Age"))
 	}
 }
 
 func TestCORSAllowedOrigin(t *testing.T) {
 	srv := serverWithCORS("https://app.example")
 	defer srv.Close()
-	resp := corsRequest(t, srv, http.MethodGet, "/v1/assets", "https://app.example")
-	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("status %d", resp.StatusCode)
+	status, header := corsRequest(t, srv, http.MethodGet, "/v1/assets", "https://app.example")
+	if status != http.StatusOK {
+		t.Fatalf("status %d", status)
 	}
-	if got := resp.Header.Get("Access-Control-Allow-Origin"); got != "https://app.example" {
+	if got := header.Get("Access-Control-Allow-Origin"); got != "https://app.example" {
 		t.Fatalf("Access-Control-Allow-Origin = %q", got)
 	}
-	if !hasVaryOrigin(resp) {
-		t.Fatalf("Vary = %q, want Origin", resp.Header.Values("Vary"))
+	if !hasVaryOrigin(header) {
+		t.Fatalf("Vary = %q, want Origin", header.Values("Vary"))
 	}
 }
 
@@ -258,18 +261,18 @@ func TestCORSDisallowedOrigin(t *testing.T) {
 	srv := serverWithCORS("https://app.example")
 	defer srv.Close()
 	for _, method := range []string{http.MethodGet, http.MethodOptions} {
-		resp := corsRequest(t, srv, method, "/v1/assets", "https://evil.example")
+		status, header := corsRequest(t, srv, method, "/v1/assets", "https://evil.example")
 		// The response is still served; the browser is what refuses it.
-		if method == http.MethodGet && resp.StatusCode != http.StatusOK {
-			t.Fatalf("status %d", resp.StatusCode)
+		if method == http.MethodGet && status != http.StatusOK {
+			t.Fatalf("status %d", status)
 		}
-		if got := resp.Header.Get("Access-Control-Allow-Origin"); got != "" {
+		if got := header.Get("Access-Control-Allow-Origin"); got != "" {
 			t.Fatalf("%s: Access-Control-Allow-Origin = %q, want none", method, got)
 		}
 		// Without Vary a cache could serve this refused answer to an
 		// allowed origin.
-		if !hasVaryOrigin(resp) {
-			t.Fatalf("%s: Vary = %q, want Origin", method, resp.Header.Values("Vary"))
+		if !hasVaryOrigin(header) {
+			t.Fatalf("%s: Vary = %q, want Origin", method, header.Values("Vary"))
 		}
 	}
 }
@@ -277,20 +280,20 @@ func TestCORSDisallowedOrigin(t *testing.T) {
 func TestCORSPreflight(t *testing.T) {
 	srv := serverWithCORS("https://app.example")
 	defer srv.Close()
-	resp := corsRequest(t, srv, http.MethodOptions, "/v1/assets", "https://app.example")
-	if resp.StatusCode != http.StatusNoContent {
-		t.Fatalf("status %d", resp.StatusCode)
+	status, header := corsRequest(t, srv, http.MethodOptions, "/v1/assets", "https://app.example")
+	if status != http.StatusNoContent {
+		t.Fatalf("status %d", status)
 	}
-	if got := resp.Header.Get("Access-Control-Allow-Origin"); got != "https://app.example" {
+	if got := header.Get("Access-Control-Allow-Origin"); got != "https://app.example" {
 		t.Fatalf("Access-Control-Allow-Origin = %q", got)
 	}
-	if got := resp.Header.Get("Access-Control-Allow-Headers"); !strings.Contains(got, "Content-Type") {
+	if got := header.Get("Access-Control-Allow-Headers"); !strings.Contains(got, "Content-Type") {
 		t.Fatalf("Access-Control-Allow-Headers = %q", got)
 	}
-	if got := resp.Header.Get("Access-Control-Max-Age"); got != "600" {
+	if got := header.Get("Access-Control-Max-Age"); got != "600" {
 		t.Fatalf("Access-Control-Max-Age = %q", got)
 	}
-	if got := resp.Header.Get("Access-Control-Allow-Methods"); !strings.Contains(got, http.MethodGet) {
+	if got := header.Get("Access-Control-Allow-Methods"); !strings.Contains(got, http.MethodGet) {
 		t.Fatalf("Access-Control-Allow-Methods = %q", got)
 	}
 }
