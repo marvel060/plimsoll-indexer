@@ -12,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/plimsoll-protocol/plimsoll-indexer/internal/buildinfo"
 	"github.com/plimsoll-protocol/plimsoll-indexer/internal/coverage"
 	"github.com/plimsoll-protocol/plimsoll-indexer/internal/store"
 )
@@ -99,6 +100,7 @@ func serverWithCORS(origins ...string) *httptest.Server {
 	}
 	s := &Server{
 		Store: f,
+		Build: buildinfo.Info{Version: "v1.2.3", Commit: "abc123", Go: "go1.27"},
 		CORS:  origins,
 		Log:   slog.New(slog.NewTextHandler(io.Discard, nil)),
 		Now:   func() time.Time { return now },
@@ -290,6 +292,15 @@ func TestCORSPreflight(t *testing.T) {
 	}
 	if got := resp.Header.Get("Access-Control-Allow-Methods"); !strings.Contains(got, http.MethodGet) {
 		t.Fatalf("Access-Control-Allow-Methods = %q", got)
+	}
+}
+
+func TestVersionEndpoint(t *testing.T) {
+	srv := server()
+	defer srv.Close()
+	body := get(t, srv, "/v1/version", 200)
+	if body["version"] != "v1.2.3" || body["commit"] != "abc123" || body["go"] != "go1.27" {
+		t.Fatalf("version %+v", body)
 	}
 }
 

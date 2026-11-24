@@ -12,6 +12,7 @@ import (
 	"strconv"
 	"time"
 
+	"github.com/plimsoll-protocol/plimsoll-indexer/internal/buildinfo"
 	"github.com/plimsoll-protocol/plimsoll-indexer/internal/coverage"
 	"github.com/plimsoll-protocol/plimsoll-indexer/internal/store"
 )
@@ -45,6 +46,7 @@ type NetworkInfo struct {
 type Server struct {
 	Store   Reader
 	Network NetworkInfo
+	Build   buildinfo.Info
 	CORS    []string
 	Log     *slog.Logger
 	Now     func() time.Time
@@ -55,6 +57,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /healthz", s.health)
 	mux.HandleFunc("GET /openapi.yaml", s.openAPI)
 	mux.HandleFunc("GET /v1/network", s.network)
+	mux.HandleFunc("GET /v1/version", s.version)
 	mux.HandleFunc("GET /v1/assets", s.listAssets)
 	mux.HandleFunc("GET /v1/assets/{sac}", s.getAsset)
 	mux.HandleFunc("GET /v1/assets/{sac}/supply", s.supplyHistory)
@@ -180,6 +183,10 @@ func (s *Server) openAPI(w http.ResponseWriter, _ *http.Request) {
 
 func (s *Server) network(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, http.StatusOK, s.Network)
+}
+
+func (s *Server) version(w http.ResponseWriter, _ *http.Request) {
+	writeJSON(w, http.StatusOK, s.Build)
 }
 
 func (s *Server) listAssets(w http.ResponseWriter, r *http.Request) {
