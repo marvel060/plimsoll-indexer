@@ -93,6 +93,7 @@ func run(cfg config.Config, log *slog.Logger) error {
 		Store:   db,
 		MaxAge:  cfg.TomlInterval,
 		Log:     log.With("job", "toml"),
+		Now:     time.Now,
 	}
 	// Checks every minute; each asset is refreshed once per TOML_INTERVAL.
 	go every(ctx, time.Minute, log.With("job", "toml"), tomlSync.Run)

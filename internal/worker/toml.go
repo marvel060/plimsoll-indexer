@@ -7,20 +7,38 @@ import (
 	"log/slog"
 	"time"
 
-	"github.com/plimsoll-protocol/plimsoll-indexer/internal/horizon"
+	"github.com/plimsoll-protocol/plimsoll-indexer/internal/coverage"
 	"github.com/plimsoll-protocol/plimsoll-indexer/internal/stellartoml"
-	"github.com/plimsoll-protocol/plimsoll-indexer/internal/store"
 )
+
+// homeDomainSource is the Horizon surface TomlSync needs: the issuer account's
+// home_domain.
+type homeDomainSource interface {
+	HomeDomain(ctx context.Context, issuer string) (string, error)
+}
+
+// tomlFetcher fetches and parses an issuer's SEP-1 stellar.toml.
+type tomlFetcher interface {
+	Fetch(ctx context.Context, domain, code, issuer string) (stellartoml.Info, error)
+}
+
+// tomlStore is the storage surface TomlSync needs.
+type tomlStore interface {
+	ListAssets(ctx context.Context) ([]coverage.Asset, error)
+	SaveToml(ctx context.Context, sac string, info []byte, lookupErr string, at time.Time) error
+}
 
 // TomlSync records what each issuer's stellar.toml says about its asset,
 // including the SEP-1 attestation_of_reserve link.
 type TomlSync struct {
-	Horizon *horizon.Client
-	Fetcher *stellartoml.Fetcher
-	Store   *store.Store
+	Horizon homeDomainSource
+	Fetcher tomlFetcher
+	Store   tomlStore
 	// MaxAge is how long a lookup result is kept before it is refreshed.
 	MaxAge time.Duration
 	Log    *slog.Logger
+	// Now returns the current time. Tests inject a fixed clock.
+	Now func() time.Time
 }
 
 func (t *TomlSync) Run(ctx context.Context) error {
@@ -28,7 +46,7 @@ func (t *TomlSync) Run(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("list assets: %w", err)
 	}
-	now := time.Now().UTC()
+	now := t.Now().UTC()
 	for _, a := range assets {
 		if a.TomlCheckedAt != nil && now.Sub(*a.TomlCheckedAt) < t.MaxAge {
 			continue
