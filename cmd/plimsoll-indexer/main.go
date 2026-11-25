@@ -36,12 +36,14 @@ func main() {
 		os.Exit(runHealthcheck())
 	}
 
-	cfg, err := config.Load()
-	log := newLogger(cfg.LogLevel)
-	if err != nil {
-		log.Error("invalid configuration", "err", err)
+	// Validate the environment before any I/O (database, RPC or listener) so
+	// an operator gets every problem at once in a readable table.
+	cfg, report := config.Validate()
+	if err := report.Err(); err != nil {
+		fmt.Fprintf(os.Stderr, "invalid configuration:\n\n%s", report.Table())
 		os.Exit(1)
 	}
+	log := newLogger(cfg.LogLevel)
 	if err := run(cfg, log); err != nil {
 		log.Error("indexer stopped", "err", err)
 		os.Exit(1)
