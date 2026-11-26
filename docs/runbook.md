@@ -37,6 +37,8 @@ values are reported together at startup.
 | `HORIZON_CHECK_URL` | empty | Second, independently operated Horizon. Empty disables the cross-check. |
 | `START_LEDGER` | `0` | First ledger to ingest. `0` or a ledger in the future means "latest"; older than RPC retention is clamped. |
 | `SUPPLY_POSTER_SECRET` | empty | Empty runs read-only. Never log or share it. |
+| `WEBHOOK_ADMIN_TOKEN` | empty | Enables authenticated webhook management when set with `WEBHOOK_ENCRYPTION_KEY`. |
+| `WEBHOOK_ENCRYPTION_KEY` | empty | Base64-encoded 32-byte key (`openssl rand -base64 32`); keep stable to preserve webhook delivery. |
 | `PORT` | `8080` | |
 | `CORS_ORIGINS` | `*` | Comma separated. |
 | `LOG_LEVEL` | `info` | `debug`, `info`, `warn`, `error`. Logs are JSON on stdout. |
@@ -80,8 +82,14 @@ version each database is at. Stop with `SIGINT` or
  "last_event_at":"...","last_event_age_seconds":0}
 ```
 
-- `503 {"status":"db_unavailable"}`: Postgres is unreachable.
-- `503 {"status":"progress_unavailable"}`: the ingest cursor cannot be read.
+- `503 {"code":"db_unavailable","message":"database is unavailable"}`: Postgres is unreachable.
+- `503 {"code":"progress_unavailable","message":"ingest progress is unavailable"}`: the ingest cursor cannot be read.
+
+Every `4xx` and `5xx` response, including the `404` and `405` the router writes
+for an unknown path or method, has the same body:
+`{"code":"…","message":"…"}` plus an optional `details` object. `code` is
+machine-readable and stable; clients should match it instead of `message`. The
+schema is `ErrorResponse` in `internal/api/openapi.yaml`.
 - `ingested_to_ledger` advances on every scan, even when nothing is stored, so
   it is **not** evidence that ingestion works. Alert on `last_event_age_seconds`
   instead. The keep-alive workflow fails when it exceeds 28800 (8 hours), which
@@ -113,6 +121,8 @@ Logs are JSON (`log/slog`). Key messages:
 | warn | `recovered a supply snapshot / reserve report from contract state...` | The reconciler filled a gap. Rows are marked `"source": "chain"` with no `tx_hash`. |
 | info | `supply posting disabled (SUPPLY_POSTER_SECRET not set)` | Expected on read-only instances. |
 | info | `supply cross-check disabled (HORIZON_CHECK_URL not set)` | The poster signs on one Horizon's word. |
+| info | `issuer stellar.toml changed` | The issuer document hash changed; includes `old_hash` and `new_hash`. |
+| error | `issuer stellar.toml change webhook delivery failed` | A destination could not receive the TOML change event. |
 
 ## Common procedures
 

@@ -25,6 +25,14 @@ type Store struct {
 	pool *pgxpool.Pool
 }
 
+type Webhook struct {
+	ID               int64
+	URL              string
+	SecretHash       string
+	SecretCiphertext []byte
+	CreatedAt        time.Time
+}
+
 // Open connects to the database and brings its schema up to date by applying
 // any pending migrations (see migrate.go).
 func Open(ctx context.Context, url string) (*Store, error) {
@@ -247,21 +255,41 @@ func (s *Store) LatestSupply(ctx context.Context, sac string) (*coverage.Supply,
 	return &h[0], nil
 }
 
+// reportHistorySQL returns one asset's reports newest-posted first. The
+// reserve_reports_sac_posted_ledger index (migration 0004) supplies that order,
+// so LIMIT stops the scan early instead of sorting the whole history.
+const reportHistorySQL = `
+	SELECT tier, amount::text, as_of, posted_at, reporter, doc_hash, doc_uri, tx_hash, source,
+	       COALESCE(doc_check, '')
+	FROM reserve_reports WHERE sac = $1
+	ORDER BY posted_ledger DESC, as_of DESC LIMIT $2`
+
 func (s *Store) ReportHistory(ctx context.Context, sac string, limit int) ([]coverage.Report, error) {
-	return s.queryReports(ctx, `
-		SELECT tier, amount::text, as_of, posted_at, reporter, doc_hash, doc_uri, tx_hash, source,
-		       COALESCE(doc_check, '')
-		FROM reserve_reports WHERE sac = $1
-		ORDER BY posted_ledger DESC, as_of DESC LIMIT $2`, sac, limit)
+	return s.queryReports(ctx, reportHistorySQL, sac, limit)
 }
+
+// latestReportsSQL asks for one report per tier, each the newest by as_of.
+//
+// It is written as one bounded lookup per tier rather than
+// `DISTINCT ON (tier)` over the asset's reports: the composite index
+// reserve_reports_sac_tier_asof (migration 0001) answers each lookup with a
+// single index probe, so the cost is O(log n) in the asset's report count
+// instead of reading and sorting every report it has ever posted.
+const latestReportsSQL = `
+	SELECT r.tier, r.amount::text, r.as_of, r.posted_at, r.reporter, r.doc_hash, r.doc_uri, r.tx_hash, r.source,
+	       COALESCE(r.doc_check, '')
+	FROM (VALUES (1::smallint), (2::smallint), (3::smallint)) AS wanted(tier)
+	CROSS JOIN LATERAL (
+		SELECT tier, amount, as_of, posted_at, reporter, doc_hash, doc_uri, tx_hash, source, doc_check
+		FROM reserve_reports
+		WHERE sac = $1 AND tier = wanted.tier
+		ORDER BY as_of DESC
+		LIMIT 1
+	) AS r`
 
 // LatestReports returns the newest report (by as_of) for each tier.
 func (s *Store) LatestReports(ctx context.Context, sac string) (map[uint32]coverage.Report, error) {
-	list, err := s.queryReports(ctx, `
-		SELECT DISTINCT ON (tier) tier, amount::text, as_of, posted_at, reporter, doc_hash, doc_uri, tx_hash, source,
-		                           COALESCE(doc_check, '')
-		FROM reserve_reports WHERE sac = $1
-		ORDER BY tier, as_of DESC`, sac)
+	list, err := s.queryReports(ctx, latestReportsSQL, sac)
 	if err != nil {
 		return nil, err
 	}
@@ -342,6 +370,79 @@ func (s *Store) SaveToml(ctx context.Context, sac string, info []byte, lookupErr
 		UPDATE assets SET toml = COALESCE($2::jsonb, toml), toml_error = NULLIF($3, ''), toml_checked_at = $4
 		WHERE sac = $1`, sac, infoArg, lookupErr, at)
 	return err
+}
+
+// SaveIssuerTomlSnapshot records a new content hash only when it differs from
+// the issuer's latest successful stellar.toml fetch.
+func (s *Store) SaveIssuerTomlSnapshot(ctx context.Context, issuer, domain, hash string, at time.Time) (string, bool, error) {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return "", false, fmt.Errorf("begin issuer TOML snapshot: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtextextended($1, 0))`, issuer); err != nil {
+		return "", false, fmt.Errorf("lock issuer TOML snapshot: %w", err)
+	}
+	var oldHash string
+	err = tx.QueryRow(ctx, `
+		SELECT sha256_hash FROM issuer_toml_snapshots
+		WHERE issuer = $1 ORDER BY id DESC LIMIT 1`, issuer).Scan(&oldHash)
+	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
+		return "", false, fmt.Errorf("read previous issuer TOML hash: %w", err)
+	}
+	changed := err == nil && oldHash != hash
+	if err == pgx.ErrNoRows || changed {
+		if _, err := tx.Exec(ctx, `
+			INSERT INTO issuer_toml_snapshots (issuer, home_domain, sha256_hash, checked_at)
+			VALUES ($1, $2, $3, $4)`, issuer, domain, hash, at); err != nil {
+			return "", false, fmt.Errorf("insert issuer TOML snapshot: %w", err)
+		}
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return "", false, fmt.Errorf("commit issuer TOML snapshot: %w", err)
+	}
+	return oldHash, changed, nil
+}
+
+func (s *Store) CreateWebhook(ctx context.Context, url, secretHash string, ciphertext []byte) (Webhook, error) {
+	var w Webhook
+	err := s.pool.QueryRow(ctx, `
+		INSERT INTO webhooks (url, secret_hash, secret_ciphertext)
+		VALUES ($1, $2, $3)
+		RETURNING id, url, secret_hash, secret_ciphertext, created_at`,
+		url, secretHash, ciphertext,
+	).Scan(&w.ID, &w.URL, &w.SecretHash, &w.SecretCiphertext, &w.CreatedAt)
+	if err != nil {
+		return Webhook{}, fmt.Errorf("create webhook: %w", err)
+	}
+	return w, nil
+}
+
+func (s *Store) ListWebhooks(ctx context.Context) ([]Webhook, error) {
+	rows, err := s.pool.Query(ctx, `
+		SELECT id, url, secret_hash, secret_ciphertext, created_at
+		FROM webhooks ORDER BY id`)
+	if err != nil {
+		return nil, fmt.Errorf("list webhooks: %w", err)
+	}
+	defer rows.Close()
+	var out []Webhook
+	for rows.Next() {
+		var w Webhook
+		if err := rows.Scan(&w.ID, &w.URL, &w.SecretHash, &w.SecretCiphertext, &w.CreatedAt); err != nil {
+			return nil, fmt.Errorf("scan webhook: %w", err)
+		}
+		out = append(out, w)
+	}
+	return out, rows.Err()
+}
+
+func (s *Store) DeleteWebhook(ctx context.Context, id int64) (bool, error) {
+	tag, err := s.pool.Exec(ctx, `DELETE FROM webhooks WHERE id = $1`, id)
+	if err != nil {
+		return false, fmt.Errorf("delete webhook: %w", err)
+	}
+	return tag.RowsAffected() != 0, nil
 }
 
 func mustBig(s string) *big.Int {

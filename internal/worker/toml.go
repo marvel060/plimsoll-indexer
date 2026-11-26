@@ -11,29 +11,31 @@ import (
 	"github.com/plimsoll-protocol/plimsoll-indexer/internal/stellartoml"
 )
 
-// homeDomainSource is the Horizon surface TomlSync needs: the issuer account's
-// home_domain.
-type homeDomainSource interface {
-	HomeDomain(ctx context.Context, issuer string) (string, error)
+type tomlHorizon interface {
+	HomeDomain(context.Context, string) (string, error)
 }
 
-// tomlFetcher fetches and parses an issuer's SEP-1 stellar.toml.
 type tomlFetcher interface {
-	Fetch(ctx context.Context, domain, code, issuer string) (stellartoml.Info, error)
+	FetchSnapshot(context.Context, string, string, string) (stellartoml.Info, string, error)
 }
 
-// tomlStore is the storage surface TomlSync needs.
 type tomlStore interface {
-	ListAssets(ctx context.Context) ([]coverage.Asset, error)
-	SaveToml(ctx context.Context, sac string, info []byte, lookupErr string, at time.Time) error
+	ListAssets(context.Context) ([]coverage.Asset, error)
+	SaveToml(context.Context, string, []byte, string, time.Time) error
+	SaveIssuerTomlSnapshot(context.Context, string, string, string, time.Time) (string, bool, error)
+}
+
+type tomlChangeNotifier interface {
+	TOMLChanged(context.Context, string, string, string, string) error
 }
 
 // TomlSync records what each issuer's stellar.toml says about its asset,
 // including the SEP-1 attestation_of_reserve link.
 type TomlSync struct {
-	Horizon homeDomainSource
-	Fetcher tomlFetcher
-	Store   tomlStore
+	Horizon  tomlHorizon
+	Fetcher  tomlFetcher
+	Store    tomlStore
+	Webhooks tomlChangeNotifier
 	// MaxAge is how long a lookup result is kept before it is refreshed.
 	MaxAge time.Duration
 	Log    *slog.Logger
@@ -51,7 +53,30 @@ func (t *TomlSync) Run(ctx context.Context) error {
 		if a.TomlCheckedAt != nil && now.Sub(*a.TomlCheckedAt) < t.MaxAge {
 			continue
 		}
-		info, lookupErr := t.lookup(ctx, a.Code, a.Issuer)
+		info, hash, lookupErr := t.lookup(ctx, a.Code, a.Issuer)
+		if hash != "" {
+			oldHash, changed, err := t.Store.SaveIssuerTomlSnapshot(ctx, a.Issuer, info.HomeDomain, hash, now)
+			if err != nil {
+				return fmt.Errorf("save TOML hash for issuer %s: %w", a.Issuer, err)
+			}
+			if changed {
+				t.Log.Info("issuer stellar.toml changed",
+					"issuer", a.Issuer,
+					"home_domain", info.HomeDomain,
+					"old_hash", oldHash,
+					"new_hash", hash)
+				if t.Webhooks != nil {
+					if err := t.Webhooks.TOMLChanged(ctx, a.Issuer, info.HomeDomain, oldHash, hash); err != nil {
+						t.Log.Error("issuer stellar.toml change webhook delivery failed",
+							"issuer", a.Issuer,
+							"home_domain", info.HomeDomain,
+							"old_hash", oldHash,
+							"new_hash", hash,
+							"err", err)
+					}
+				}
+			}
+		}
 		var body []byte
 		msg := ""
 		if lookupErr != nil {
@@ -71,10 +96,10 @@ func (t *TomlSync) Run(ctx context.Context) error {
 	return nil
 }
 
-func (t *TomlSync) lookup(ctx context.Context, code, issuer string) (stellartoml.Info, error) {
+func (t *TomlSync) lookup(ctx context.Context, code, issuer string) (stellartoml.Info, string, error) {
 	domain, err := t.Horizon.HomeDomain(ctx, issuer)
 	if err != nil {
-		return stellartoml.Info{}, err
+		return stellartoml.Info{}, "", err
 	}
-	return t.Fetcher.Fetch(ctx, domain, code, issuer)
+	return t.Fetcher.FetchSnapshot(ctx, domain, code, issuer)
 }

@@ -18,12 +18,13 @@ import (
 	"github.com/stellar/go-stellar-sdk/keypair"
 
 	"github.com/plimsoll-protocol/plimsoll-indexer/internal/api"
-	"github.com/plimsoll-protocol/plimsoll-indexer/internal/buildinfo"
+	"github.com/plimsoll-protocol/plimsoll-indexer/internal/changelog"
 	"github.com/plimsoll-protocol/plimsoll-indexer/internal/config"
 	"github.com/plimsoll-protocol/plimsoll-indexer/internal/horizon"
 	"github.com/plimsoll-protocol/plimsoll-indexer/internal/soroban"
 	"github.com/plimsoll-protocol/plimsoll-indexer/internal/stellartoml"
 	"github.com/plimsoll-protocol/plimsoll-indexer/internal/store"
+	"github.com/plimsoll-protocol/plimsoll-indexer/internal/webhook"
 	"github.com/plimsoll-protocol/plimsoll-indexer/internal/worker"
 )
 
@@ -63,6 +64,16 @@ func run(cfg config.Config, build buildinfo.Info, log *slog.Logger) error {
 	defer rpc.Close()
 	hz := horizon.NewClient(cfg.HorizonURL)
 
+	var webhookCodec *webhook.SecretCodec
+	var webhookDispatcher *webhook.Dispatcher
+	if cfg.WebhookAdminToken != "" {
+		webhookCodec, err = webhook.NewSecretCodec(cfg.WebhookEncryptionKey)
+		if err != nil {
+			return err
+		}
+		webhookDispatcher = webhook.NewDispatcher(db, webhookCodec)
+	}
+
 	ingester := &worker.Ingester{
 		RPC:         rpc,
 		Store:       db,
@@ -91,12 +102,12 @@ func run(cfg config.Config, build buildinfo.Info, log *slog.Logger) error {
 	go every(ctx, cfg.ReconcileInterval, log.With("job", "reconcile"), reconciler.Run)
 
 	tomlSync := &worker.TomlSync{
-		Horizon: hz,
-		Fetcher: stellartoml.NewFetcher(),
-		Store:   db,
-		MaxAge:  cfg.TomlInterval,
-		Log:     log.With("job", "toml"),
-		Now:     time.Now,
+		Horizon:  hz,
+		Fetcher:  stellartoml.NewFetcher(),
+		Store:    db,
+		Webhooks: webhookDispatcher,
+		MaxAge:   cfg.TomlInterval,
+		Log:      log.With("job", "toml"),
 	}
 	// Checks every minute; each asset is refreshed once per TOML_INTERVAL.
 	go every(ctx, time.Minute, log.With("job", "toml"), tomlSync.Run)
@@ -151,10 +162,20 @@ func run(cfg config.Config, build buildinfo.Info, log *slog.Logger) error {
 		log.Info("supply posting disabled (SUPPLY_POSTER_SECRET not set)")
 	}
 
+	// A malformed changelog would break the published API contract, so refuse
+	// to start rather than serve it.
+	changes, err := changelog.Load()
+	if err != nil {
+		return err
+	}
+
 	srv := &http.Server{
 		Addr: ":" + cfg.Port,
 		Handler: (&api.Server{
-			Store: db,
+			Store:             db,
+			WebhookStore:      db,
+			WebhookAdminToken: cfg.WebhookAdminToken,
+			WebhookCodec:      webhookCodec,
 			Network: api.NetworkInfo{
 				NetworkPassphrase:  cfg.NetworkPassphrase,
 				RPCURL:             cfg.RPCURL,
@@ -162,10 +183,10 @@ func run(cfg config.Config, build buildinfo.Info, log *slog.Logger) error {
 				CoverageLedgerID:   cfg.CoverageLedgerID,
 				ReporterRegistryID: cfg.ReporterRegistryID,
 			},
-			Build: build,
-			CORS:  cfg.CORSOrigins,
-			Log:   log.With("component", "api"),
-			Now:   time.Now,
+			CORS:      cfg.CORSOrigins,
+			Log:       log.With("component", "api"),
+			Now:       time.Now,
+			Changelog: changes,
 		}).Handler(),
 		ReadHeaderTimeout: 10 * time.Second,
 	}
